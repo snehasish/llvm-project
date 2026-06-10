@@ -24,7 +24,9 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
+#include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -52,9 +54,11 @@
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CodeGen.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
@@ -73,6 +77,19 @@ using MBBVector = SmallVector<MachineBasicBlock *, 4>;
 
 STATISTIC(NumLeafFuncWithSpills, "Number of leaf functions with CSRs");
 STATISTIC(NumFuncSeen, "Number of functions seen in PEI");
+
+// Profile-guided stack layout (PGSL) prototype: x86-64 +
+// IR-instrumentation-PGO only. Not LLVM_DEBUG-gated so it works in
+// no-asserts release builds.
+static cl::opt<bool> EnablePGOStackLayout(
+    "enable-pgo-stack-layout", cl::Hidden, cl::init(false),
+    cl::desc("Enable profile-guided stack frame layout (prototype; x86-64 "
+             "with IR instrumentation profile only)"));
+
+static cl::opt<bool> PGSLDump(
+    "pgsl-dump", cl::Hidden, cl::init(false),
+    cl::desc("Dump per-slot frame layout with profile-weighted access counts "
+             "(requires -enable-pgo-stack-layout)"));
 
 
 namespace {
@@ -97,6 +114,11 @@ class PEIImpl {
   // Emit remarks.
   MachineOptimizationRemarkEmitter *ORE = nullptr;
 
+  // Profile info for PGSL; only non-null when -enable-pgo-stack-layout is
+  // set (legacy PM only).
+  MachineBlockFrequencyInfo *MBFI = nullptr;
+  ProfileSummaryInfo *PSI = nullptr;
+
   void calculateCallFrameInfo(MachineFunction &MF);
   void calculateSaveRestoreBlocks(MachineFunction &MF);
   void spillCalleeSavedRegs(MachineFunction &MF);
@@ -120,7 +142,10 @@ class PEIImpl {
   void insertZeroCallUsedRegs(MachineFunction &MF);
 
 public:
-  PEIImpl(MachineOptimizationRemarkEmitter *ORE) : ORE(ORE) {}
+  PEIImpl(MachineOptimizationRemarkEmitter *ORE,
+          MachineBlockFrequencyInfo *MBFI = nullptr,
+          ProfileSummaryInfo *PSI = nullptr)
+      : ORE(ORE), MBFI(MBFI), PSI(PSI) {}
   bool run(MachineFunction &MF);
 };
 
@@ -148,6 +173,8 @@ INITIALIZE_PASS_BEGIN(PEILegacy, DEBUG_TYPE, "Prologue/Epilogue Insertion",
 INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(MachineDominatorTreeWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(MachineOptimizationRemarkEmitterPass)
+INITIALIZE_PASS_DEPENDENCY(MachineBlockFrequencyInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(ProfileSummaryInfoWrapperPass)
 INITIALIZE_PASS_END(PEILegacy, DEBUG_TYPE,
                     "Prologue/Epilogue Insertion & Frame Finalization", false,
                     false)
@@ -164,6 +191,10 @@ void PEILegacy::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addPreserved<MachineLoopInfoWrapperPass>();
   AU.addPreserved<MachineDominatorTreeWrapperPass>();
   AU.addRequired<MachineOptimizationRemarkEmitterPass>();
+  if (EnablePGOStackLayout) {
+    AU.addRequired<MachineBlockFrequencyInfoWrapperPass>();
+    AU.addRequired<ProfileSummaryInfoWrapperPass>();
+  }
   MachineFunctionPass::getAnalysisUsage(AU);
 }
 
@@ -354,7 +385,13 @@ bool PEIImpl::run(MachineFunction &MF) {
 bool PEILegacy::runOnMachineFunction(MachineFunction &MF) {
   MachineOptimizationRemarkEmitter *ORE =
       &getAnalysis<MachineOptimizationRemarkEmitterPass>().getORE();
-  return PEIImpl(ORE).run(MF);
+  MachineBlockFrequencyInfo *MBFI = nullptr;
+  ProfileSummaryInfo *PSI = nullptr;
+  if (EnablePGOStackLayout) {
+    MBFI = &getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
+    PSI = &getAnalysis<ProfileSummaryInfoWrapperPass>().getPSI();
+  }
+  return PEIImpl(ORE, MBFI, PSI).run(MF);
 }
 
 PreservedAnalyses
@@ -855,6 +892,52 @@ static void AssignProtectedObjSet(const StackObjSet &UnassignedObjs,
   }
 }
 
+static bool shouldRunPGSL(const MachineFunction &MF,
+                          const ProfileSummaryInfo *PSI) {
+  return EnablePGOStackLayout &&
+         MF.getTarget().getTargetTriple().getArch() == Triple::x86_64 && PSI &&
+         PSI->hasInstrumentationProfile();
+}
+
+/// Dump one machine-parseable line per allocated stack slot: size, alignment,
+/// profile-weighted access count (sum of block profile counts over real
+/// instructions with an FI operand), final offset, and 64-byte line index.
+/// Consumed by the PGSL aggregation scripts (E0 study).
+static void dumpPGSLSlots(const MachineFunction &MF,
+                          ArrayRef<int> ObjectsToAllocate,
+                          const MachineBlockFrequencyInfo &MBFI) {
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+  SmallDenseMap<int, uint64_t, 32> WeightedAccesses;
+  for (int FI : ObjectsToAllocate)
+    WeightedAccesses[FI] = 0;
+  for (const MachineBasicBlock &MBB : MF) {
+    uint64_t Count = MBFI.getBlockProfileCount(&MBB).value_or(0);
+    for (const MachineInstr &MI : MBB) {
+      if (MI.isDebugInstr())
+        continue;
+      for (const MachineOperand &MO : MI.operands()) {
+        if (!MO.isFI())
+          continue;
+        auto It = WeightedAccesses.find(MO.getIndex());
+        if (It != WeightedAccesses.end())
+          It->second += Count;
+      }
+    }
+  }
+  uint64_t EntryCount = 0;
+  if (auto EC = MF.getFunction().getEntryCount())
+    EntryCount = EC->getCount();
+  errs() << "PGSL: func=" << MF.getName() << " entry_count=" << EntryCount
+         << " slots=" << ObjectsToAllocate.size() << '\n';
+  for (int FI : ObjectsToAllocate) {
+    int64_t Off = MFI.getObjectOffset(FI);
+    errs() << "PGSL: fi=" << FI << " size=" << MFI.getObjectSize(FI)
+           << " align=" << MFI.getObjectAlign(FI).value()
+           << " waccess=" << WeightedAccesses.lookup(FI) << " offset=" << Off
+           << " line=" << divideFloorSigned(Off, 64) << '\n';
+  }
+}
+
 /// calculateFrameObjectOffsets - Calculate actual frame offsets for all of the
 /// abstract stack objects.
 void PEIImpl::calculateFrameObjectOffsets(MachineFunction &MF) {
@@ -1104,6 +1187,9 @@ void PEIImpl::calculateFrameObjectOffsets(MachineFunction &MF) {
     if (!scavengeStackSlot(MFI, Object, StackGrowsDown, MaxAlign,
                            StackBytesFree))
       AdjustStackOffset(MFI, Object, StackGrowsDown, Offset, MaxAlign);
+
+  if (PGSLDump && MBFI && shouldRunPGSL(MF, PSI))
+    dumpPGSLSlots(MF, ObjectsToAllocate, *MBFI);
 
   // Make sure the special register scavenging spill slot is closest to the
   // stack pointer.
