@@ -91,6 +91,11 @@ static cl::opt<bool> PGSLDump(
     cl::desc("Dump per-slot frame layout with profile-weighted access counts "
              "(requires -enable-pgo-stack-layout)"));
 
+static cl::opt<unsigned> PGSLMode(
+    "pgsl-mode", cl::Hidden, cl::init(1),
+    cl::desc("PGO stack layout mode: 1 = hotness ordering, 2 = affinity "
+             "clustering"));
+
 
 namespace {
 
@@ -899,14 +904,11 @@ static bool shouldRunPGSL(const MachineFunction &MF,
          PSI->hasInstrumentationProfile();
 }
 
-/// Dump one machine-parseable line per allocated stack slot: size, alignment,
-/// profile-weighted access count (sum of block profile counts over real
-/// instructions with an FI operand), final offset, and 64-byte line index.
-/// Consumed by the PGSL aggregation scripts (E0 study).
-static void dumpPGSLSlots(const MachineFunction &MF,
-                          ArrayRef<int> ObjectsToAllocate,
-                          const MachineBlockFrequencyInfo &MBFI) {
-  const MachineFrameInfo &MFI = MF.getFrameInfo();
+/// Profile-weighted access count per frame index: sum of block profile counts
+/// over real (non-debug) instructions with an FI operand.
+static SmallDenseMap<int, uint64_t, 32>
+computePGSLWeights(const MachineFunction &MF, ArrayRef<int> ObjectsToAllocate,
+                   const MachineBlockFrequencyInfo &MBFI) {
   SmallDenseMap<int, uint64_t, 32> WeightedAccesses;
   for (int FI : ObjectsToAllocate)
     WeightedAccesses[FI] = 0;
@@ -924,6 +926,38 @@ static void dumpPGSLSlots(const MachineFunction &MF,
       }
     }
   }
+  return WeightedAccesses;
+}
+
+/// Mode 1: reorder ObjectsToAllocate so the profile-hottest slots get the
+/// smallest offsets from the base register. Runs after the target's static
+/// ordering; equal-weight slots (in particular the zero-weight cold tail)
+/// keep that order under the stable sort. Direction convention matches
+/// X86FrameLowering::orderFrameObjects: the END of the list lands nearest
+/// SP; flipped when accesses are FP-relative.
+static void pgslOrderFrameObjects(const MachineFunction &MF,
+                                  SmallVectorImpl<int> &ObjectsToAllocate,
+                                  const MachineBlockFrequencyInfo &MBFI) {
+  SmallDenseMap<int, uint64_t, 32> Weights =
+      computePGSLWeights(MF, ObjectsToAllocate, MBFI);
+  llvm::stable_sort(ObjectsToAllocate, [&](int A, int B) {
+    return Weights.lookup(A) < Weights.lookup(B);
+  });
+  const TargetRegisterInfo *TRI = MF.getSubtarget().getRegisterInfo();
+  const TargetFrameLowering &TFI = *MF.getSubtarget().getFrameLowering();
+  if (!TRI->hasStackRealignment(MF) && TFI.hasFP(MF))
+    std::reverse(ObjectsToAllocate.begin(), ObjectsToAllocate.end());
+}
+
+/// Dump one machine-parseable line per allocated stack slot: size, alignment,
+/// profile-weighted access count, final offset, and 64-byte line index.
+/// Consumed by the PGSL aggregation scripts (E0 study).
+static void dumpPGSLSlots(const MachineFunction &MF,
+                          ArrayRef<int> ObjectsToAllocate,
+                          const MachineBlockFrequencyInfo &MBFI) {
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+  SmallDenseMap<int, uint64_t, 32> WeightedAccesses =
+      computePGSLWeights(MF, ObjectsToAllocate, MBFI);
   uint64_t EntryCount = 0;
   if (auto EC = MF.getFunction().getEntryCount())
     EntryCount = EC->getCount();
@@ -1168,16 +1202,21 @@ void PEIImpl::calculateFrameObjectOffsets(MachineFunction &MF) {
                       MaxAlign);
 
   // Give the targets a chance to order the objects the way they like it.
+  bool PGSLActive = MBFI && shouldRunPGSL(MF, PSI);
   if (MF.getTarget().getOptLevel() != CodeGenOptLevel::None &&
-      MF.getTarget().Options.StackSymbolOrdering)
+      MF.getTarget().Options.StackSymbolOrdering) {
     TFI.orderFrameObjects(MF, ObjectsToAllocate);
+    if (PGSLActive && PGSLMode == 1)
+      pgslOrderFrameObjects(MF, ObjectsToAllocate, *MBFI);
+  }
 
   // Keep track of which bytes in the fixed and callee-save range are used so we
   // can use the holes when allocating later stack objects.  Only do this if
   // stack protector isn't being used and the target requests it and we're
-  // optimizing.
+  // optimizing. Hole-filling would break the adjacency PGSL just arranged, so
+  // it is disabled when PGSL is active.
   BitVector StackBytesFree;
-  if (!ObjectsToAllocate.empty() &&
+  if (!PGSLActive && !ObjectsToAllocate.empty() &&
       MF.getTarget().getOptLevel() != CodeGenOptLevel::None &&
       MFI.getStackProtectorIndex() < 0 && TFI.enableStackSlotScavenging(MF))
     computeFreeStackSlots(MFI, StackGrowsDown, FixedCSEnd, StackBytesFree);
@@ -1188,7 +1227,7 @@ void PEIImpl::calculateFrameObjectOffsets(MachineFunction &MF) {
                            StackBytesFree))
       AdjustStackOffset(MFI, Object, StackGrowsDown, Offset, MaxAlign);
 
-  if (PGSLDump && MBFI && shouldRunPGSL(MF, PSI))
+  if (PGSLDump && PGSLActive)
     dumpPGSLSlots(MF, ObjectsToAllocate, *MBFI);
 
   // Make sure the special register scavenging spill slot is closest to the
