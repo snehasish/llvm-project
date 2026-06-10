@@ -66,6 +66,7 @@
 #include <cassert>
 #include <cstdint>
 #include <limits>
+#include <numeric>
 #include <utility>
 #include <vector>
 
@@ -95,6 +96,17 @@ static cl::opt<unsigned> PGSLMode(
     "pgsl-mode", cl::Hidden, cl::init(1),
     cl::desc("PGO stack layout mode: 1 = hotness ordering, 2 = affinity "
              "clustering"));
+
+static cl::opt<bool> PGSLAlignClusters(
+    "pgsl-align-clusters", cl::Hidden, cl::init(false),
+    cl::desc("Bump the leading member of each PGSL cluster to 64-byte "
+             "alignment so the cluster body does not straddle cache lines "
+             "(mode 2 only; raises frame alignment)"));
+
+// Mode-2 tuning constants (fixed for the prototype, see design.md §3.3).
+constexpr unsigned PGSLWindowSize = 8;     // FI-touching instrs per window
+constexpr uint64_t PGSLClusterBytes = 64;  // packed cluster size budget
+constexpr unsigned PGSLMaxHotSlots = 128;  // clustering candidate cap
 
 
 namespace {
@@ -949,6 +961,164 @@ static void pgslOrderFrameObjects(const MachineFunction &MF,
     std::reverse(ObjectsToAllocate.begin(), ObjectsToAllocate.end());
 }
 
+/// Mode 2: affinity clustering. Co-accessed hot slots (pairs of FIs touched
+/// within a sliding window of the last PGSLWindowSize FI-touching
+/// instructions of a block, edge weight += block profile count) are greedily
+/// merged into clusters of packed size <= PGSLClusterBytes, heaviest edge
+/// first. Clusters (singletons included, so no merges degenerates to mode 1)
+/// are laid out contiguously, ordered coldest-first in the canonical
+/// SP-relative direction; cold/uncounted slots keep the target's static
+/// order as the tail farthest from SP. With -pgsl-align-clusters, the first
+/// allocated member of each multi-member cluster is bumped to 64-byte
+/// alignment: grows-down allocation aligns that member's low edge, pinning a
+/// line boundary under it so the remaining <=64B of the cluster fills one
+/// line (the bumped leader itself sits adjacent above the boundary).
+static void pgslClusterFrameObjects(MachineFunction &MF,
+                                    SmallVectorImpl<int> &ObjectsToAllocate,
+                                    const MachineBlockFrequencyInfo &MBFI) {
+  MachineFrameInfo &MFI = MF.getFrameInfo();
+  SmallDenseMap<int, uint64_t, 32> Weights =
+      computePGSLWeights(MF, ObjectsToAllocate, MBFI);
+
+  // Clustering candidates: the hottest profiled, fixed-size slots.
+  SmallVector<int, 32> Hot;
+  for (int FI : ObjectsToAllocate)
+    if (Weights.lookup(FI) > 0 && !MFI.isVariableSizedObjectIndex(FI))
+      Hot.push_back(FI);
+  llvm::stable_sort(Hot, [&](int A, int B) {
+    return std::make_pair(Weights.lookup(B), A) <
+           std::make_pair(Weights.lookup(A), B);
+  });
+  if (Hot.size() > PGSLMaxHotSlots)
+    Hot.resize(PGSLMaxHotSlots);
+  SmallDenseSet<int, 32> HotSet(Hot.begin(), Hot.end());
+
+  // Affinity edges between hot slots, keyed (loFI << 32 | hiFI).
+  DenseMap<uint64_t, uint64_t> EdgeWeight;
+  for (const MachineBasicBlock &MBB : MF) {
+    uint64_t Count = MBFI.getBlockProfileCount(&MBB).value_or(0);
+    if (!Count)
+      continue;
+    SmallVector<SmallVector<int, 2>, PGSLWindowSize> Window;
+    for (const MachineInstr &MI : MBB) {
+      if (MI.isDebugInstr())
+        continue;
+      SmallVector<int, 2> FIs;
+      for (const MachineOperand &MO : MI.operands())
+        if (MO.isFI() && HotSet.count(MO.getIndex()) &&
+            !llvm::is_contained(FIs, MO.getIndex()))
+          FIs.push_back(MO.getIndex());
+      if (FIs.empty())
+        continue;
+      auto AddEdge = [&](int A, int B) {
+        if (A == B)
+          return;
+        if (A > B)
+          std::swap(A, B);
+        EdgeWeight[(uint64_t(A) << 32) | uint32_t(B)] += Count;
+      };
+      for (unsigned I = 0; I < FIs.size(); ++I) {
+        for (unsigned J = I + 1; J < FIs.size(); ++J)
+          AddEdge(FIs[I], FIs[J]);
+        for (const auto &Entry : Window)
+          for (int W : Entry)
+            AddEdge(FIs[I], W);
+      }
+      Window.push_back(FIs);
+      if (Window.size() > PGSLWindowSize)
+        Window.erase(Window.begin());
+    }
+  }
+
+  // Greedy merge, heaviest edge first (key ascending on ties for
+  // determinism), respecting the packed-size budget.
+  SmallVector<std::pair<uint64_t, uint64_t>, 32> Edges; // (weight, key)
+  for (const auto &KV : EdgeWeight)
+    Edges.push_back({KV.second, KV.first});
+  llvm::sort(Edges, [](const auto &A, const auto &B) {
+    return std::make_pair(A.first, B.second) >
+           std::make_pair(B.first, A.second);
+  });
+
+  SmallDenseMap<int, int, 32> Parent;
+  SmallDenseMap<int, uint64_t, 32> ClusterSize;
+  for (int FI : Hot) {
+    Parent[FI] = FI;
+    ClusterSize[FI] = std::max<int64_t>(MFI.getObjectSize(FI), 0);
+  }
+  auto Find = [&](int FI) {
+    while (Parent[FI] != FI)
+      FI = Parent[FI] = Parent[Parent[FI]];
+    return FI;
+  };
+  for (const auto &[W, Key] : Edges) {
+    int RA = Find(int(Key >> 32)), RB = Find(int(uint32_t(Key)));
+    if (RA == RB || ClusterSize[RA] + ClusterSize[RB] > PGSLClusterBytes)
+      continue;
+    Parent[RB] = RA;
+    ClusterSize[RA] += ClusterSize[RB];
+  }
+
+  // Gather clusters; iterating Hot (hotness-descending) keeps member lists
+  // and root discovery deterministic.
+  SmallDenseMap<int, unsigned, 32> RootToCluster;
+  SmallVector<SmallVector<int, 4>, 16> Members;
+  SmallVector<uint64_t, 16> ClusterWeight;
+  for (int FI : Hot) {
+    int Root = Find(FI);
+    auto [It, New] = RootToCluster.try_emplace(Root, Members.size());
+    if (New) {
+      Members.emplace_back();
+      ClusterWeight.push_back(0);
+    }
+    Members[It->second].push_back(FI);
+    ClusterWeight[It->second] += Weights.lookup(FI);
+  }
+  SmallVector<unsigned, 16> Order(Members.size());
+  std::iota(Order.begin(), Order.end(), 0);
+  llvm::stable_sort(Order, [&](unsigned A, unsigned B) {
+    return std::make_pair(ClusterWeight[A], Members[B][0]) <
+           std::make_pair(ClusterWeight[B], Members[A][0]);
+  });
+  for (auto &M : Members)
+    llvm::stable_sort(M, [&](int A, int B) {
+      return std::make_tuple(MFI.getObjectAlign(B), Weights.lookup(B), A) <
+             std::make_tuple(MFI.getObjectAlign(A), Weights.lookup(A), B);
+    });
+
+  // Rebuild: cold tail (static order) first = farthest from SP in the
+  // canonical direction, then clusters coldest to hottest.
+  SmallVector<int, 8> NewOrder;
+  for (int FI : ObjectsToAllocate)
+    if (!HotSet.count(FI))
+      NewOrder.push_back(FI);
+  SmallVector<std::pair<unsigned, unsigned>, 16> ClusterSpans; // [begin, end)
+  for (unsigned CI : Order) {
+    unsigned Begin = NewOrder.size();
+    NewOrder.append(Members[CI].begin(), Members[CI].end());
+    if (Members[CI].size() > 1)
+      ClusterSpans.push_back({Begin, (unsigned)NewOrder.size()});
+  }
+  assert(NewOrder.size() == ObjectsToAllocate.size());
+  std::copy(NewOrder.begin(), NewOrder.end(), ObjectsToAllocate.begin());
+
+  const TargetRegisterInfo *TRI = MF.getSubtarget().getRegisterInfo();
+  const TargetFrameLowering &TFI = *MF.getSubtarget().getFrameLowering();
+  bool Flipped = !TRI->hasStackRealignment(MF) && TFI.hasFP(MF);
+  if (Flipped)
+    std::reverse(ObjectsToAllocate.begin(), ObjectsToAllocate.end());
+
+  // The alignment bump goes on each cluster's first *allocated* member.
+  if (PGSLAlignClusters) {
+    unsigned N = ObjectsToAllocate.size();
+    for (auto [Begin, End] : ClusterSpans) {
+      unsigned Lead = Flipped ? N - End : Begin;
+      int FI = ObjectsToAllocate[Lead];
+      MFI.setObjectAlignment(FI, std::max(MFI.getObjectAlign(FI), Align(64)));
+    }
+  }
+}
+
 /// Dump one machine-parseable line per allocated stack slot: size, alignment,
 /// profile-weighted access count, final offset, and 64-byte line index.
 /// Consumed by the PGSL aggregation scripts (E0 study).
@@ -1208,6 +1378,8 @@ void PEIImpl::calculateFrameObjectOffsets(MachineFunction &MF) {
     TFI.orderFrameObjects(MF, ObjectsToAllocate);
     if (PGSLActive && PGSLMode == 1)
       pgslOrderFrameObjects(MF, ObjectsToAllocate, *MBFI);
+    else if (PGSLActive && PGSLMode == 2)
+      pgslClusterFrameObjects(MF, ObjectsToAllocate, *MBFI);
   }
 
   // Keep track of which bytes in the fixed and callee-save range are used so we
