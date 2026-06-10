@@ -1199,6 +1199,9 @@ public:
   // Annotate the value profile call sites for one value kind.
   void annotateValueSites(uint32_t Kind);
 
+  // Emit function-level !rifs.args metadata from IPVK_ArgValue profiles.
+  void annotateArgValueMetadata();
+
   // Annotate the irreducible loop header weights.
   void annotateIrrLoopHeaderWeights();
 
@@ -1852,10 +1855,12 @@ void PGOUseFunc::annotateValueSites(uint32_t Kind) {
   // Argument value profiles cannot use per-instruction VP metadata: all
   // argument sites of a function share the entry instruction as their anchor,
   // and annotateValueSite holds only one VP node per (instruction, kind).
-  // They are consumed as function-level metadata instead (emitted separately
-  // under -vp-arg-values; not implemented yet).
-  if (Kind == IPVK_ArgValue)
+  // They are emitted as function-level !rifs.args metadata instead.
+  if (Kind == IPVK_ArgValue) {
+    if (EnableArgValueProfiling)
+      annotateArgValueMetadata();
     return;
+  }
 
   unsigned ValueSiteIndex = 0;
 
@@ -1897,6 +1902,64 @@ void PGOUseFunc::annotateValueSites(uint32_t Kind) {
         getMaxNumAnnotations(static_cast<InstrProfValueKind>(Kind)));
     ValueSiteIndex++;
   }
+}
+
+// Emit one !rifs.args function-level metadata node listing, per profiled
+// argument site, !{i32 argno, i64 total, i64 value0, i64 count0, ...} with
+// the top -icp-max-annotations values by count. The total is the function
+// entry count, not the sum of the site's value counts: the runtime tracks a
+// bounded number of distinct values per site with eviction, so the summed
+// counts undercount total entries for high-cardinality arguments.
+void PGOUseFunc::annotateArgValueMetadata() {
+  unsigned NumValueSites = ProfileRecord.getNumValueSites(IPVK_ArgValue);
+  if (NumValueSites == 0)
+    return;
+
+  auto &ValueSites = FuncInfo.ValueSites[IPVK_ArgValue];
+  if (NumValueSites != ValueSites.size()) {
+    auto &Ctx = M->getContext();
+    Ctx.diagnose(DiagnosticInfoPGOProfile(
+        M->getName().data(),
+        Twine("Inconsistent number of value sites for ") +
+            Twine(ValueProfKindDescr[IPVK_ArgValue]) +
+            Twine(" profiling in \"") + F.getName().str() +
+            Twine("\", possibly due to the use of a stale profile."),
+        DS_Warning));
+    return;
+  }
+
+  uint64_t Total = F.getEntryCount() ? F.getEntryCount()->getCount() : 0;
+  LLVMContext &Ctx = M->getContext();
+  Type *I32Ty = Type::getInt32Ty(Ctx);
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+  SmallVector<Metadata *, 8> ArgMDs;
+  for (unsigned I = 0; I < NumValueSites; ++I) {
+    SmallVector<InstrProfValueData, 8> VDs(
+        ProfileRecord.getValueArrayForSite(IPVK_ArgValue, I));
+    if (VDs.empty())
+      continue;
+    llvm::stable_sort(VDs, [](const InstrProfValueData &A,
+                              const InstrProfValueData &B) {
+      return A.Count > B.Count;
+    });
+
+    const Argument *A = cast<Argument>(ValueSites[I].V);
+    SmallVector<Metadata *, 8> Ops;
+    Ops.push_back(
+        ConstantAsMetadata::get(ConstantInt::get(I32Ty, A->getArgNo())));
+    Ops.push_back(ConstantAsMetadata::get(ConstantInt::get(I64Ty, Total)));
+    for (const InstrProfValueData &V :
+         ArrayRef(VDs).take_front(MaxNumAnnotations)) {
+      Ops.push_back(
+          ConstantAsMetadata::get(ConstantInt::get(I64Ty, V.Value)));
+      Ops.push_back(
+          ConstantAsMetadata::get(ConstantInt::get(I64Ty, V.Count)));
+    }
+    ArgMDs.push_back(MDTuple::get(Ctx, Ops));
+  }
+  if (ArgMDs.empty())
+    return;
+  F.setMetadata("rifs.args", MDNode::get(Ctx, ArgMDs));
 }
 
 // Collect the set of members for each Comdat in module M and store
