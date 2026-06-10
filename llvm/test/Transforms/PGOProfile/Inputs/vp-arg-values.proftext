@@ -1,0 +1,23 @@
+# IR level Instrumentation Flag
+:ir
+foo
+# Func Hash:
+742261418966908927
+# Num Counters:
+1
+# Counter Values:
+1000
+# Num Value Kinds:
+1
+# ValueKind = IPVK_ArgValue:
+3
+# NumValueSites:
+2
+5
+7:970
+3:12
+9:8
+1:6
+0:4
+1
+42:1000
