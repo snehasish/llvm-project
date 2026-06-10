@@ -236,6 +236,12 @@ cl::opt<bool> EnableVTableProfileUse(
              "profiles will be used by ICP pass for more efficient indirect "
              "call sequence. If false, type profiles won't be used."));
 
+cl::opt<bool> EnableArgValueProfiling(
+    "vp-arg-values", cl::init(false),
+    cl::desc("If true, instrument integer-typed function arguments at "
+             "function entry to collect their dynamic value profiles "
+             "(RIFS prototype)."));
+
 std::string getInstrProfSectionName(InstrProfSectKind IPSK,
                                     Triple::ObjectFormatType OF,
                                     bool AddSegmentInfo) {
@@ -1673,6 +1679,9 @@ void OverlapStats::dump(raw_fd_ostream &OS) const {
       break;
     case IPVK_VTableTarget:
       strncpy(ProfileKindName, "VTable", 19);
+      break;
+    case IPVK_ArgValue:
+      strncpy(ProfileKindName, "ArgValue", 19);
       break;
     default:
       snprintf(ProfileKindName, 19, "VP[%d]", I);

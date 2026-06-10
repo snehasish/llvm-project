@@ -358,6 +358,7 @@ extern cl::opt<std::string> ViewBlockFreqFuncName;
 // ProfileData/InstrProf.cpp: -enable-vtable-value-profiling=
 extern cl::opt<bool> EnableVTableValueProfiling;
 extern cl::opt<bool> EnableVTableProfileUse;
+extern cl::opt<bool> EnableArgValueProfiling;
 LLVM_ABI extern cl::opt<InstrProfCorrelator::ProfCorrelatorKind>
     ProfileCorrelate;
 } // namespace llvm
@@ -664,6 +665,8 @@ public:
       ValueSites[IPVK_IndirectCallTarget] = VPC.get(IPVK_IndirectCallTarget);
       if (EnableVTableValueProfiling)
         ValueSites[IPVK_VTableTarget] = VPC.get(IPVK_VTableTarget);
+      if (EnableArgValueProfiling)
+        ValueSites[IPVK_ArgValue] = VPC.get(IPVK_ArgValue);
     } else {
       NumOfCSPGOSelectInsts += SIVisitor.getNumOfSelectInsts();
       NumOfCSPGOMemIntrinsics += ValueSites[IPVK_MemOPSize].size();
@@ -1845,6 +1848,15 @@ void PGOUseFunc::annotateValueSites() {
 // Annotate the instructions for a specific value kind.
 void PGOUseFunc::annotateValueSites(uint32_t Kind) {
   assert(Kind <= IPVK_Last);
+
+  // Argument value profiles cannot use per-instruction VP metadata: all
+  // argument sites of a function share the entry instruction as their anchor,
+  // and annotateValueSite holds only one VP node per (instruction, kind).
+  // They are consumed as function-level metadata instead (emitted separately
+  // under -vp-arg-values; not implemented yet).
+  if (Kind == IPVK_ArgValue)
+    return;
+
   unsigned ValueSiteIndex = 0;
 
   unsigned NumValueSites = ProfileRecord.getNumValueSites(Kind);

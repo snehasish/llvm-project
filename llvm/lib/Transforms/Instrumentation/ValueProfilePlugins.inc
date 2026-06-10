@@ -122,8 +122,43 @@ public:
   }
 };
 
+///------------------------- FunctionArgPlugin --------------------------------
+/// Profile the runtime values of integer-typed arguments at function entry
+/// (RIFS prototype). One candidate per qualifying argument, in argument-index
+/// order; gen and use side rely on this order for site matching.
+static cl::opt<unsigned> RIFSMinFuncSize(
+    "rifs-min-func-size", cl::init(20),
+    cl::desc("Do not value-profile arguments of functions with fewer than "
+             "this many instructions (bounds instrumentation overhead on "
+             "trivial functions)."));
+
+class FunctionArgPlugin {
+  Function &F;
+
+public:
+  static constexpr InstrProfValueKind Kind = IPVK_ArgValue;
+
+  FunctionArgPlugin(Function &Fn, TargetLibraryInfo &TLI) : F(Fn) {}
+
+  void run(std::vector<CandidateInfo> &Candidates) {
+    if (F.isDeclaration() || F.getInstructionCount() < RIFSMinFuncSize)
+      return;
+    Instruction *InsertPt = &*F.getEntryBlock().getFirstNonPHIOrDbgOrAlloca();
+    for (Argument &A : F.args()) {
+      auto *IntTy = dyn_cast<IntegerType>(A.getType());
+      if (!IntTy || IntTy->getBitWidth() > 64)
+        continue;
+      // An argument with no users cannot enable any specialization.
+      if (A.use_empty())
+        continue;
+      Candidates.emplace_back(CandidateInfo{&A, InsertPt, InsertPt});
+    }
+  }
+};
+
 ///----------------------- Registration of the plugins -------------------------
 /// For now, registering a plugin with the ValueProfileCollector is done by
 /// adding the plugin type to the VP_PLUGIN_LIST macro.
 #define VP_PLUGIN_LIST                                                         \
-  MemIntrinsicPlugin, IndirectCallPromotionPlugin, VTableProfilingPlugin
+  MemIntrinsicPlugin, IndirectCallPromotionPlugin, VTableProfilingPlugin,      \
+      FunctionArgPlugin
