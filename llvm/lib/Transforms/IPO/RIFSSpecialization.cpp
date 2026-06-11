@@ -129,6 +129,32 @@ PreservedAnalyses RIFSSpecializationPass::run(Module &M,
     }
   }
 
+  // Module-level denominator for the E0 claimed-savings-share metric:
+  // profile-weighted dynamic instruction count over all profiled functions,
+  // candidates or not. Emitted once per module so per-TU dumps can be
+  // aggregated without a second pass over the corpus.
+  uint64_t DynInsts = 0;
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    auto EC = F.getEntryCount();
+    if (!EC || EC->getCount() == 0)
+      continue;
+    auto &BFI = FAM.getResult<BlockFrequencyAnalysis>(F);
+    for (BasicBlock &BB : F) {
+      std::optional<uint64_t> BBCount = BFI.getBlockProfileCount(&BB);
+      if (!BBCount)
+        continue;
+      uint64_t Size = 0;
+      for (Instruction &I : BB)
+        if (!I.isDebugOrPseudoInst())
+          ++Size;
+      DynInsts += *BBCount * Size;
+    }
+  }
+  errs() << "RIFS-MODULE: id=" << M.getName() << " dyninsts=" << DynInsts
+         << "\n";
+
   // Analyze mode reads the IR and writes only to stderr.
   return PreservedAnalyses::all();
 }
