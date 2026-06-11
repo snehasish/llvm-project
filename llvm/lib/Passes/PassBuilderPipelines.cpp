@@ -71,6 +71,7 @@
 #include "llvm/Transforms/IPO/ModuleInliner.h"
 #include "llvm/Transforms/IPO/OpenMPOpt.h"
 #include "llvm/Transforms/IPO/PartialInlining.h"
+#include "llvm/Transforms/IPO/RIFSSpecialization.h"
 #include "llvm/Transforms/IPO/SCCP.h"
 #include "llvm/Transforms/IPO/SampleProfile.h"
 #include "llvm/Transforms/IPO/SampleProfileProbe.h"
@@ -329,6 +330,7 @@ static cl::opt<bool> EnableDevirtualizeSpeculatively(
 
 extern cl::opt<std::string> UseCtxProfile;
 extern cl::opt<bool> PGOInstrumentColdFunctionOnly;
+extern cl::opt<unsigned> RIFSMode;
 
 extern cl::opt<bool> EnableMemProfContextDisambiguation;
 } // namespace llvm
@@ -1304,6 +1306,13 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
 
   if (IsPGOInstrGen || IsPGOInstrUse || IsCtxProfGen)
     MPM.addPass(PGOIndirectCallPromotion(false, false));
+
+  // RIFS prototype (analyze/transform of dynamically-invariant integer
+  // arguments): consumes the !rifs.args metadata emitted by the PGO use pass
+  // above; like ICP, must run before the inliner so clones collapse before
+  // inline costs are evaluated. Off unless -rifs-mode is set.
+  if (RIFSMode != 0 && IsPGOInstrUse)
+    MPM.addPass(RIFSSpecializationPass());
 
   if (IsPGOPreLink && PGOOpt->CSAction == PGOOptions::CSIRInstr)
     MPM.addPass(PGOInstrumentationGenCreateVar(PGOOpt->CSProfileGenFile,
