@@ -32,6 +32,11 @@ slow:
 ;; (98%) but the savings must be zero — the K3 guard-overhead control of
 ;; design.md §3-E1 in miniature.
 ; ANALYZE: RIFS: fn=passthru arg=0 value=3 count=490 total=500 ratio=0.9800 entry=500 size=2 codesize=0 latency=0
+;; Module denominator: profile-weighted dynamic instructions across all
+;; profiled functions. @branchy: entry [icmp,br] 2x1000 + fast [add,ret]
+;; 2x970 + slow [sdiv,mul,ret] 3x30 = 4030; @passthru: [add,ret] 2x500 =
+;; 1000; total 5030.
+; ANALYZE: RIFS-MODULE: id={{.*}} dyninsts=5030
 define i32 @passthru(i32 %m, i32 %x) !prof !11 !rifs.args !21 {
 entry:
   %s = add i32 %x, 5
