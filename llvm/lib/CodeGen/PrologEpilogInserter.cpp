@@ -66,6 +66,7 @@
 #include <cassert>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <utility>
 #include <vector>
@@ -95,7 +96,7 @@ static cl::opt<bool> PGSLDump(
 static cl::opt<unsigned> PGSLMode(
     "pgsl-mode", cl::Hidden, cl::init(1),
     cl::desc("PGO stack layout mode: 1 = hotness ordering, 2 = affinity "
-             "clustering"));
+             "clustering, 3 = geometry-preserving hotness ordering"));
 
 static cl::opt<bool> PGSLAlignClusters(
     "pgsl-align-clusters", cl::Hidden, cl::init(false),
@@ -934,7 +935,7 @@ computePGSLWeights(const MachineFunction &MF, ArrayRef<int> ObjectsToAllocate,
           continue;
         auto It = WeightedAccesses.find(MO.getIndex());
         if (It != WeightedAccesses.end())
-          It->second += Count;
+          It->second = SaturatingAdd(It->second, Count);
       }
     }
   }
@@ -952,13 +953,37 @@ static void pgslOrderFrameObjects(const MachineFunction &MF,
                                   const MachineBlockFrequencyInfo &MBFI) {
   SmallDenseMap<int, uint64_t, 32> Weights =
       computePGSLWeights(MF, ObjectsToAllocate, MBFI);
-  llvm::stable_sort(ObjectsToAllocate, [&](int A, int B) {
-    return Weights.lookup(A) < Weights.lookup(B);
-  });
   const TargetRegisterInfo *TRI = MF.getSubtarget().getRegisterInfo();
   const TargetFrameLowering &TFI = *MF.getSubtarget().getFrameLowering();
-  if (!TRI->hasStackRealignment(MF) && TFI.hasFP(MF))
-    std::reverse(ObjectsToAllocate.begin(), ObjectsToAllocate.end());
+  bool FPRelative = !TRI->hasStackRealignment(MF) && TFI.hasFP(MF);
+  auto Less = [&](int A, int B) {
+    return FPRelative ? Weights.lookup(A) > Weights.lookup(B)
+                      : Weights.lookup(A) < Weights.lookup(B);
+  };
+  if (PGSLMode != 3) {
+    // Sort in the final direction so equal weights retain target order.
+    llvm::stable_sort(ObjectsToAllocate, Less);
+    return;
+  }
+
+  // Mode 3 only exchanges objects with identical allocation geometry.
+  // Every allocation step therefore sees the same size/alignment as the
+  // target ordering: no added padding, alignment, or loss of scavenged holes.
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+  std::map<std::pair<int64_t, uint64_t>, SmallVector<unsigned, 8>> Groups;
+  for (unsigned I = 0; I < ObjectsToAllocate.size(); ++I) {
+    int FI = ObjectsToAllocate[I];
+    if (!MFI.isVariableSizedObjectIndex(FI))
+      Groups[{MFI.getObjectSize(FI), MFI.getObjectAlign(FI).value()}].push_back(I);
+  }
+  for (const auto &Group : Groups) {
+    SmallVector<int, 8> Slots;
+    for (unsigned I : Group.second)
+      Slots.push_back(ObjectsToAllocate[I]);
+    llvm::stable_sort(Slots, Less);
+    for (unsigned I = 0; I < Slots.size(); ++I)
+      ObjectsToAllocate[Group.second[I]] = Slots[I];
+  }
 }
 
 /// Mode 2: affinity clustering. Co-accessed hot slots (pairs of FIs touched
@@ -1015,7 +1040,8 @@ static void pgslClusterFrameObjects(MachineFunction &MF,
           return;
         if (A > B)
           std::swap(A, B);
-        EdgeWeight[(uint64_t(A) << 32) | uint32_t(B)] += Count;
+        auto &Weight = EdgeWeight[(uint64_t(A) << 32) | uint32_t(B)];
+        Weight = SaturatingAdd(Weight, Count);
       };
       for (unsigned I = 0; I < FIs.size(); ++I) {
         for (unsigned J = I + 1; J < FIs.size(); ++J)
@@ -1044,7 +1070,11 @@ static void pgslClusterFrameObjects(MachineFunction &MF,
   SmallDenseMap<int, uint64_t, 32> ClusterSize;
   for (int FI : Hot) {
     Parent[FI] = FI;
-    ClusterSize[FI] = std::max<int64_t>(MFI.getObjectSize(FI), 0);
+    // Upper bound including worst-case padding at every allocation step.
+    // Summing payload bytes alone does not bound a cluster's extent.
+    ClusterSize[FI] = SaturatingAdd(
+        uint64_t(std::max<int64_t>(MFI.getObjectSize(FI), 0)),
+        MFI.getObjectAlign(FI).value() - 1);
   }
   auto Find = [&](int FI) {
     while (Parent[FI] != FI)
@@ -1053,7 +1083,7 @@ static void pgslClusterFrameObjects(MachineFunction &MF,
   };
   for (const auto &[W, Key] : Edges) {
     int RA = Find(int(Key >> 32)), RB = Find(int(uint32_t(Key)));
-    if (RA == RB || ClusterSize[RA] + ClusterSize[RB] > PGSLClusterBytes)
+    if (RA == RB || SaturatingAdd(ClusterSize[RA], ClusterSize[RB]) > PGSLClusterBytes)
       continue;
     Parent[RB] = RA;
     ClusterSize[RA] += ClusterSize[RB];
@@ -1072,7 +1102,8 @@ static void pgslClusterFrameObjects(MachineFunction &MF,
       ClusterWeight.push_back(0);
     }
     Members[It->second].push_back(FI);
-    ClusterWeight[It->second] += Weights.lookup(FI);
+    ClusterWeight[It->second] =
+        SaturatingAdd(ClusterWeight[It->second], Weights.lookup(FI));
   }
   SmallVector<unsigned, 16> Order(Members.size());
   std::iota(Order.begin(), Order.end(), 0);
@@ -1085,6 +1116,14 @@ static void pgslClusterFrameObjects(MachineFunction &MF,
       return std::make_tuple(MFI.getObjectAlign(B), Weights.lookup(B), A) <
              std::make_tuple(MFI.getObjectAlign(A), Weights.lookup(A), B);
     });
+
+  const TargetRegisterInfo *TRI = MF.getSubtarget().getRegisterInfo();
+  const TargetFrameLowering &TFI = *MF.getSubtarget().getFrameLowering();
+  bool Flipped = !TRI->hasStackRealignment(MF) && TFI.hasFP(MF);
+  // Undo the target's FP reversal before building the canonical sequence.
+  // The final reversal then preserves the target order of the cold tail.
+  if (Flipped)
+    std::reverse(ObjectsToAllocate.begin(), ObjectsToAllocate.end());
 
   // Rebuild: cold tail (static order) first = farthest from SP in the
   // canonical direction, then clusters coldest to hottest.
@@ -1102,14 +1141,16 @@ static void pgslClusterFrameObjects(MachineFunction &MF,
   assert(NewOrder.size() == ObjectsToAllocate.size());
   std::copy(NewOrder.begin(), NewOrder.end(), ObjectsToAllocate.begin());
 
-  const TargetRegisterInfo *TRI = MF.getSubtarget().getRegisterInfo();
-  const TargetFrameLowering &TFI = *MF.getSubtarget().getFrameLowering();
-  bool Flipped = !TRI->hasStackRealignment(MF) && TFI.hasFP(MF);
   if (Flipped)
     std::reverse(ObjectsToAllocate.begin(), ObjectsToAllocate.end());
 
   // The alignment bump goes on each cluster's first *allocated* member.
   if (PGSLAlignClusters) {
+    // Register reservation and callee-save selection happened before this
+    // point. Introducing realignment here can require an unsaved FP/BP.
+    if (MFI.getMaxAlign() < Align(64))
+      report_fatal_error("PGSL cluster alignment requires an already "
+                         "64-byte-aligned frame");
     unsigned N = ObjectsToAllocate.size();
     for (auto [Begin, End] : ClusterSpans) {
       unsigned Lead = Flipped ? N - End : Begin;
@@ -1373,12 +1414,17 @@ void PEIImpl::calculateFrameObjectOffsets(MachineFunction &MF) {
 
   // Give the targets a chance to order the objects the way they like it.
   bool PGSLActive = MBFI && shouldRunPGSL(MF, PSI);
+  if (PGSLActive && PGSLMode > 3)
+    report_fatal_error("pgsl-mode must be between 0 and 3");
+  bool PGSLReorder = PGSLActive && PGSLMode != 0 &&
+      MF.getTarget().getOptLevel() != CodeGenOptLevel::None &&
+      MF.getTarget().Options.StackSymbolOrdering;
   if (MF.getTarget().getOptLevel() != CodeGenOptLevel::None &&
       MF.getTarget().Options.StackSymbolOrdering) {
     TFI.orderFrameObjects(MF, ObjectsToAllocate);
-    if (PGSLActive && PGSLMode == 1)
+    if (PGSLReorder && (PGSLMode == 1 || PGSLMode == 3))
       pgslOrderFrameObjects(MF, ObjectsToAllocate, *MBFI);
-    else if (PGSLActive && PGSLMode == 2)
+    else if (PGSLReorder && PGSLMode == 2)
       pgslClusterFrameObjects(MF, ObjectsToAllocate, *MBFI);
   }
 
@@ -1388,7 +1434,7 @@ void PEIImpl::calculateFrameObjectOffsets(MachineFunction &MF) {
   // optimizing. Hole-filling would break the adjacency PGSL just arranged, so
   // it is disabled when PGSL is active.
   BitVector StackBytesFree;
-  if (!PGSLActive && !ObjectsToAllocate.empty() &&
+  if ((!PGSLReorder || PGSLMode == 3) && !ObjectsToAllocate.empty() &&
       MF.getTarget().getOptLevel() != CodeGenOptLevel::None &&
       MFI.getStackProtectorIndex() < 0 && TFI.enableStackSlotScavenging(MF))
     computeFreeStackSlots(MFI, StackGrowsDown, FixedCSEnd, StackBytesFree);
