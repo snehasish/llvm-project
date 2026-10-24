@@ -308,6 +308,14 @@ struct Config {
   llvm::SmallVector<llvm::StringRef, 0> passPlugins;
   llvm::SmallVector<llvm::StringRef, 0> searchPaths;
   llvm::SmallVector<llvm::StringRef, 0> symbolOrderingFile;
+  // With -z symbol-ordering-sections, `@section <name>` lines in
+  // --symbol-ordering-file assign the input sections of the symbols that
+  // follow to the named text output section (.text, .text.hot, .text.unlikely
+  // or .text.unknown), and `@default <name>` names the output section for
+  // unlisted ".text.<suffix>" input sections without a recognized prefix.
+  llvm::DenseMap<llvm::CachedHashStringRef, llvm::StringRef>
+      symbolOrderingSections;
+  llvm::StringRef symbolOrderingDefaultTextSection;
   llvm::SmallVector<llvm::StringRef, 0> thinLTOModulesToCompile;
   llvm::StringRef dtltoDistributor;
   llvm::SmallVector<llvm::StringRef, 0> dtltoDistributorArgs;
@@ -442,6 +450,7 @@ struct Config {
   bool zInterpose;
   bool zKeepDataSectionPrefix;
   bool zKeepTextSectionPrefix;
+  bool zSymbolOrderingSections;
   bool zLrodataAfterBss;
   bool zMarkPlt;
   bool zNoBtCfi;

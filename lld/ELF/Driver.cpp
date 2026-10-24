@@ -1331,14 +1331,44 @@ getOldNewOptionsExtra(Ctx &ctx, opt::InputArgList &args, unsigned id) {
   return {oldDir, newDir, extraDir};
 }
 
-// Parse the symbol ordering file and warn for any duplicate entries.
+static bool isSymbolOrderingTextSection(StringRef name) {
+  return name == ".text" || name == ".text.hot" || name == ".text.unlikely" ||
+         name == ".text.unknown";
+}
+
+// Parse the symbol ordering file and warn for any duplicate entries. With
+// -z symbol-ordering-sections, `@section <name>` and `@default <name>` lines
+// select text output sections (see Config::symbolOrderingSections).
 static SmallVector<StringRef, 0> getSymbolOrderingFile(Ctx &ctx,
                                                        MemoryBufferRef mb) {
   SetVector<StringRef, SmallVector<StringRef, 0>> names;
-  for (StringRef s : args::getLines(mb))
+  StringRef section;
+  for (StringRef s : args::getLines(mb)) {
+    if (ctx.arg.zSymbolOrderingSections && s.starts_with("@")) {
+      auto [directive, value] = s.split(' ');
+      value = value.trim();
+      if (!isSymbolOrderingTextSection(value)) {
+        ErrAlways(ctx) << mb.getBufferIdentifier() << ": " << directive
+                       << " expects .text, .text.hot, .text.unlikely or "
+                          ".text.unknown: "
+                       << s;
+      } else if (directive == "@section") {
+        section = value;
+      } else if (directive == "@default") {
+        ctx.arg.symbolOrderingDefaultTextSection = value;
+      } else {
+        ErrAlways(ctx) << mb.getBufferIdentifier()
+                       << ": unknown symbol ordering directive: " << s;
+      }
+      continue;
+    }
     if (!names.insert(s) && ctx.arg.warnSymbolOrdering)
       Warn(ctx) << mb.getBufferIdentifier()
                 << ": duplicate ordered symbol: " << s;
+    if (!section.empty())
+      ctx.arg.symbolOrderingSections.try_emplace(CachedHashStringRef(s),
+                                                 section);
+  }
 
   return names.takeVector();
 }
@@ -1682,6 +1712,8 @@ static void readConfigs(Ctx &ctx, opt::InputArgList &args) {
       args, "keep-data-section-prefix", "nokeep-data-section-prefix", false);
   ctx.arg.zKeepTextSectionPrefix = getZFlag(
       args, "keep-text-section-prefix", "nokeep-text-section-prefix", false);
+  ctx.arg.zSymbolOrderingSections = getZFlag(
+      args, "symbol-ordering-sections", "nosymbol-ordering-sections", false);
   ctx.arg.zLrodataAfterBss =
       getZFlag(args, "lrodata-after-bss", "nolrodata-after-bss", false);
   ctx.arg.zMarkPlt = getZFlag(args, "mark-plt", "nomark-plt", false);
@@ -3623,6 +3655,7 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &args) {
     // sections. Input sections that were not handled by scripts are called
     // "orphans", and they are assigned to output sections by the default rule.
     // Process that.
+    ctx.script->buildSymbolOrderingSections();
     ctx.script->addOrphanSections();
   }
 

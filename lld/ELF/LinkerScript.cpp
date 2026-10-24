@@ -99,11 +99,24 @@ StringRef LinkerScript::getOutputSectionName(const InputSectionBase *s) const {
   // profile inaccuracy. Techniques such as hugepage remapping can make
   // conservative decisions at the section granularity.
   if (isSectionPrefix(".text", s->name)) {
+    // -z symbol-ordering-sections: an `@section` request for a function in
+    // this input section overrides the name prefix.
+    if (!symbolOrderingSections.empty()) {
+      auto it = symbolOrderingSections.find(s);
+      if (it != symbolOrderingSections.end())
+        return it->second;
+    }
     if (ctx.arg.zKeepTextSectionPrefix)
       for (StringRef v : {".text.hot", ".text.unknown", ".text.unlikely",
                           ".text.startup", ".text.exit", ".text.split"})
         if (isSectionPrefix(v.substr(5), s->name.substr(5)))
           return v;
+    // `@default`: unlisted single-function text sections without a recognized
+    // prefix (with -ffunction-sections -fno-unique-section-names they are all
+    // named ".text"). Sections holding several functions stay in .text.
+    if (!ctx.arg.symbolOrderingDefaultTextSection.empty() &&
+        symbolOrderingSingleFunctionSections.contains(s))
+      return ctx.arg.symbolOrderingDefaultTextSection;
     return ".text";
   }
   if (isSectionPrefix(".ltext", s->name)) {
@@ -1056,6 +1069,81 @@ static OutputDesc *addInputSec(Ctx &ctx,
 }
 
 // Add sections that didn't match any sections command.
+// Ranks the text output sections an `@section` directive may name, so that
+// the hottest request wins when several listed symbols share one section.
+static int textSectionRank(StringRef name) {
+  if (name == ".text.hot")
+    return 0;
+  if (name == ".text")
+    return 1;
+  if (name == ".text.unknown")
+    return 2;
+  return 3;
+}
+
+// Classifies .text* input sections by their function symbols and maps the
+// input sections of the symbols tagged with `@section` in the symbol ordering
+// file (-z symbol-ordering-sections) to the requested text output sections.
+// Only sections that hold exactly one function (every STT_FUNC symbol at
+// offset 0) may be moved, by `@section` or `@default`, so a section is never
+// relocated on behalf of a symbol it merely contains. Must run before
+// addOrphanSections().
+void LinkerScript::buildSymbolOrderingSections() {
+  if (ctx.arg.symbolOrderingSections.empty() &&
+      ctx.arg.symbolOrderingDefaultTextSection.empty())
+    return;
+  // Bit 0: a function starts at offset 0; bit 1: a function starts elsewhere.
+  DenseMap<const InputSectionBase *, uint8_t> funcLayout;
+  auto classify = [&](Symbol &sym) {
+    auto *d = dyn_cast<Defined>(&sym);
+    if (!d || d->type != STT_FUNC)
+      return;
+    auto *sec = dyn_cast_or_null<InputSectionBase>(d->section);
+    if (!sec || !isSectionPrefix(".text", sec->name))
+      return;
+    funcLayout[sec] |= d->value == 0 ? 1 : 2;
+  };
+  for (Symbol *sym : ctx.symtab->getSymbols())
+    classify(*sym);
+  for (ELFFileBase *file : ctx.objectFiles)
+    for (Symbol *sym : file->getLocalSymbols())
+      classify(*sym);
+  for (auto &[sec, layout] : funcLayout)
+    if (layout == 1)
+      symbolOrderingSingleFunctionSections.insert(sec);
+
+  if (ctx.arg.symbolOrderingSections.empty())
+    return;
+  auto addSym = [&](Symbol &sym) {
+    auto it =
+        ctx.arg.symbolOrderingSections.find(CachedHashStringRef(sym.getName()));
+    if (it == ctx.arg.symbolOrderingSections.end())
+      return;
+    auto *d = dyn_cast<Defined>(&sym);
+    if (!d || d->type != STT_FUNC)
+      return;
+    auto *sec = dyn_cast_or_null<InputSectionBase>(d->section);
+    if (!sec || !isSectionPrefix(".text", sec->name))
+      return;
+    if (!symbolOrderingSingleFunctionSections.contains(sec)) {
+      if (ctx.arg.warnSymbolOrdering)
+        Warn(ctx) << "symbol ordering file: " << sym.getName()
+                  << " shares its input section with other functions; "
+                     "@section ignored";
+      return;
+    }
+    auto [slot, inserted] = symbolOrderingSections.try_emplace(sec, it->second);
+    if (!inserted &&
+        textSectionRank(it->second) < textSectionRank(slot->second))
+      slot->second = it->second;
+  };
+  for (Symbol *sym : ctx.symtab->getSymbols())
+    addSym(*sym);
+  for (ELFFileBase *file : ctx.objectFiles)
+    for (Symbol *sym : file->getLocalSymbols())
+      addSym(*sym);
+}
+
 void LinkerScript::addOrphanSections() {
   StringMap<TinyPtrVector<OutputSection *>> map;
   SmallVector<OutputDesc *, 0> v;

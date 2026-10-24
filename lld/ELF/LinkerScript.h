@@ -16,6 +16,7 @@
 #include "lld/Common/Strings.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -317,6 +318,12 @@ class LinkerScript final {
   Ctx &ctx;
   SmallVector<std::unique_ptr<OutputDesc>, 0> descPool;
   llvm::DenseMap<llvm::CachedHashStringRef, OutputDesc *> nameToOutputSection;
+  // Text output section requested for an input section through `@section`
+  // directives in the symbol ordering file (-z symbol-ordering-sections).
+  llvm::DenseMap<const InputSectionBase *, StringRef> symbolOrderingSections;
+  // .text* input sections holding exactly one function (every STT_FUNC symbol
+  // at offset 0): the only sections `@section` and `@default` may move.
+  llvm::DenseSet<const InputSectionBase *> symbolOrderingSingleFunctionSections;
 
   StringRef getOutputSectionName(const InputSectionBase *s) const;
   void addSymbol(SymbolAssignment *cmd);
@@ -367,6 +374,7 @@ public:
 
   ExprValue getSymbolValue(StringRef name, const Twine &loc);
 
+  void buildSymbolOrderingSections();
   void addOrphanSections();
   void diagnoseOrphanHandling() const;
   void diagnoseMissingSGSectionAddress() const;
