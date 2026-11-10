@@ -61,8 +61,6 @@ using namespace clang::CodeGen;
 
 static SourceLocation getMacroDebugLoc(const CodeGenModule &CGM,
                                        SourceLocation Loc) {
-  if (CGM.getCodeGenOpts().DebugInfoMacroExpansionLoc)
-    return Loc;
   // Resolving the file location of very deep macro expansion chains is
   // expensive, so fall back to the expansion location for them.
   const SourceManager &SM = CGM.getContext().getSourceManager();
@@ -5354,9 +5352,7 @@ void CGDebugInfo::EmitLocation(CGBuilderTy &Builder, SourceLocation Loc) {
   // Update our current location
   setLocation(Loc);
 
-  if (CurLoc.isInvalid() ||
-      (CGM.getCodeGenOpts().DebugInfoMacroExpansionLoc && CurLoc.isMacroID()) ||
-      LexicalBlockStack.empty())
+  if (CurLoc.isInvalid() || LexicalBlockStack.empty())
     return;
 
   llvm::MDNode *Scope = LexicalBlockStack.back();

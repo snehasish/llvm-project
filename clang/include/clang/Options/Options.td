@@ -8152,10 +8152,6 @@ let Visibility = [CC1Option, CC1AsOption] in {
 def debug_info_macro : Flag<["-"], "debug-info-macro">,
   HelpText<"Emit macro debug information">,
   MarshallingInfoFlag<CodeGenOpts<"MacroDebugInfo">>;
-def debug_info_macro_expansion_loc
-    : Flag<["-"], "debug-info-macro-expansion-loc">,
-      HelpText<"Use expansion location for debug info for multi line macros">,
-      MarshallingInfoFlag<CodeGenOpts<"DebugInfoMacroExpansionLoc">>;
 def debug_info_macro_max_depth_EQ
     : Joined<["-"], "debug-info-macro-max-depth=">,
       MetaVarName<"<N>">,

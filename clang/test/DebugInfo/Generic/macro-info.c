@@ -1,5 +1,4 @@
-// RUN: %clang_cc1 %s -debug-info-kind=standalone -emit-llvm -o - | FileCheck %s --check-prefix=NEW
-// RUN: %clang_cc1 %s -debug-info-kind=standalone -emit-llvm -debug-info-macro-expansion-loc -o - | FileCheck %s --check-prefix=OLD
+// RUN: %clang_cc1 %s -debug-info-kind=standalone -emit-llvm -o - | FileCheck %s
 // RUN: %clang_cc1 %s -debug-info-kind=standalone -emit-llvm -debug-info-macro-max-depth=15 -o - | FileCheck %s --check-prefix=DEPTH15
 // RUN: %clang_cc1 %s -debug-info-kind=standalone -emit-llvm -debug-info-macro-max-depth=14 -o - | FileCheck %s --check-prefix=DEPTH14
 
@@ -12,13 +11,11 @@
 
 SAME_ORDER(
   int
-// NEW: DIGlobalVariable(name: "global",{{.*}} line: [[@LINE+2]]
-// OLD: DIGlobalVariable(name: "global",{{.*}} line: [[@LINE-3]]
+// CHECK: DIGlobalVariable(name: "global",{{.*}} line: [[@LINE+1]]
     GLOBAL  // <- global
       () = 42,
   const char* s() {
-// NEW: DIGlobalVariable({{.*}}line: [[@LINE+2]],{{.*}} type: [[TYPEID:![0-9]+]]
-// OLD: DIGlobalVariable({{.*}}line: [[@LINE-8]],{{.*}} type: [[TYPEID:![0-9]+]]
+// CHECK: DIGlobalVariable({{.*}}line: [[@LINE+1]],{{.*}} type: [[TYPEID:![0-9]+]]
     return "1234567890";
   }
 )
@@ -26,10 +23,8 @@ SAME_ORDER(
 SWAP_ORDER(
   int GLOBAL(  // <- global2
     2) = 43,
-// NEW: DIGlobalVariable(name: "global3",{{.*}} line: [[@LINE+5]]
-// NEW: DIGlobalVariable(name: "global2",{{.*}} line: [[@LINE-3]]
-// OLD: DIGlobalVariable(name: "global3",{{.*}} line: [[@LINE-5]]
-// OLD: DIGlobalVariable(name: "global2",{{.*}} line: [[@LINE-6]]
+// CHECK: DIGlobalVariable(name: "global3",{{.*}} line: [[@LINE+3]]
+// CHECK: DIGlobalVariable(name: "global2",{{.*}} line: [[@LINE-3]]
   DECL_GLOBAL(
     GLOBAL(  // <- global3
       3)) = 44
@@ -37,8 +32,7 @@ SWAP_ORDER(
 
 
 DECL_GLOBAL(
-// NEW: DIGlobalVariable(name: "global4",{{.*}} line: [[@LINE+2]]
-// OLD: DIGlobalVariable(name: "global4",{{.*}} line: [[@LINE-2]]
+// CHECK: DIGlobalVariable(name: "global4",{{.*}} line: [[@LINE+1]]
   GLOBAL(  // <- global4
     4));
 
@@ -55,13 +49,11 @@ DECL_GLOBAL(
 #define ID512(x) ID256(ID256(x))
 
 ID8(
-// NEW: DIGlobalVariable(name: "global5",{{.*}} line: [[@LINE+4]]
-// OLD: DIGlobalVariable(name: "global5",{{.*}} line: [[@LINE-2]]
+// CHECK: DIGlobalVariable(name: "global5",{{.*}} line: [[@LINE+3]]
 // DEPTH15: DIGlobalVariable(name: "global5",{{.*}} line: [[@LINE+2]]
-// DEPTH14: DIGlobalVariable(name: "global5",{{.*}} line: [[@LINE-4]]
+// DEPTH14: DIGlobalVariable(name: "global5",{{.*}} line: [[@LINE-3]]
   int global5);
 
 ID512(
-// NEW: DIGlobalVariable(name: "global6",{{.*}} line: [[@LINE-1]]
-// OLD: DIGlobalVariable(name: "global6",{{.*}} line: [[@LINE-2]]
+// CHECK: DIGlobalVariable(name: "global6",{{.*}} line: [[@LINE-1]]
   int global6);
